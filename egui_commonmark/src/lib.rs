@@ -222,6 +222,20 @@ impl<'f> CommonMarkViewer<'f> {
         self
     }
 
+    /// Set the font family used for `**strong**` runs.
+    ///
+    /// When `None` (the default), `RichText::strong()` is applied — egui only
+    /// adjusts color, so the rendered weight depends entirely on the active
+    /// body font. When a host application has already pinned the body to a
+    /// specific family (typically via `ui.style_mut().override_font_id`), this
+    /// hook lets it route strong runs to a sibling SemiBold/Bold face.
+    ///
+    /// The family is applied at the current body font size.
+    pub fn strong_font_family(mut self, family: Option<egui::FontFamily>) -> Self {
+        self.options.strong_font_family = family;
+        self
+    }
+
     /// Shows rendered markdown
     pub fn show(
         self,

@@ -1,5 +1,5 @@
 use crate::alerts::AlertBundle;
-use egui::{RichText, TextBuffer, TextStyle, Ui, text::LayoutJob};
+use egui::{FontFamily, FontId, RichText, TextBuffer, TextStyle, Ui, text::LayoutJob};
 use std::collections::HashMap;
 
 use crate::pulldown::ScrollableCache;
@@ -33,6 +33,12 @@ pub struct CommonMarkOptions<'f> {
     pub mutable: bool,
     pub math_fn: Option<&'f crate::RenderMathFn>,
     pub html_fn: Option<&'f crate::RenderHtmlFn>,
+    /// Font family used for `**strong**` runs. When `None`, `RichText::strong()`
+    /// is applied (color change only). When set, the strong run is rendered
+    /// with the given family at body size — letting host apps wire in a
+    /// dedicated SemiBold/Bold face when the surrounding `override_font_id`
+    /// already pins the body to a specific family.
+    pub strong_font_family: Option<FontFamily>,
 }
 
 impl std::fmt::Debug for CommonMarkOptions<'_> {
@@ -76,6 +82,7 @@ impl Default for CommonMarkOptions<'_> {
             mutable: false,
             math_fn: None,
             html_fn: None,
+            strong_font_family: None,
         }
     }
 }
@@ -118,7 +125,53 @@ pub struct Style {
 }
 
 impl Style {
+    /// Resolve the [`FontId`] that a non-heading inline run with this style
+    /// will be rendered with. Centralizes the body / monospace / strong-family
+    /// decision so the renderer (`to_richtext_with`) and any measurement
+    /// code stay in sync.
+    ///
+    /// Headings are deliberately *not* covered here — heading sizing is
+    /// expressed via `RichText::heading()` / `RichText::size(...)` and the
+    /// renderer keeps its own per-level size computation. Callers that
+    /// measure non-table prose should fall back to the heading-size branch
+    /// of `to_richtext_with` if they need that.
+    pub fn resolve_font_id(
+        &self,
+        ui_style: &egui::Style,
+        strong_family: Option<&FontFamily>,
+    ) -> FontId {
+        if self.code {
+            return TextStyle::Monospace.resolve(ui_style);
+        }
+        let body = ui_style
+            .override_font_id
+            .clone()
+            .unwrap_or_else(|| TextStyle::Body.resolve(ui_style));
+        if self.strong && self.heading.is_none() {
+            if let Some(family) = strong_family {
+                return FontId {
+                    size: body.size,
+                    family: family.clone(),
+                };
+            }
+        }
+        body
+    }
+
     pub fn to_richtext(&self, ui: &Ui, text: &str) -> RichText {
+        self.to_richtext_with(ui, text, None)
+    }
+
+    /// Like [`to_richtext`], but lets the caller specify a font family that
+    /// should be used for `**strong**` runs (e.g. a SemiBold/Bold sibling of
+    /// the body family). When `strong_family` is `None` the behavior matches
+    /// [`to_richtext`].
+    pub fn to_richtext_with(
+        &self,
+        ui: &Ui,
+        text: &str,
+        strong_family: Option<&FontFamily>,
+    ) -> RichText {
         let mut text = RichText::new(text);
 
         if let Some(level) = self.heading {
@@ -168,6 +221,13 @@ impl Style {
 
         if self.strong {
             text = text.strong();
+            // Headings call `.strong()` + `.size(...)` themselves, and
+            // `.code()` selects the Monospace text_style. Calling `.font(...)`
+            // here would clobber both — `resolve_font_id` returns the body
+            // FontId for those cases, and the early-return below skips it.
+            if self.heading.is_none() && !self.code && strong_family.is_some() {
+                text = text.font(self.resolve_font_id(ui.style(), strong_family));
+            }
         }
 
         if self.emphasis {
@@ -402,6 +462,15 @@ fn default_theme(ui: &Ui) -> &str {
     }
 }
 
+/// Cached per-table column metrics. Recomputed only when the table's
+/// content hash changes.
+#[derive(Debug, Default, Clone)]
+pub struct TableLayoutCache {
+    pub content_hash: u64,
+    pub col_natural: Vec<f32>,
+    pub col_min: Vec<f32>,
+}
+
 /// A cache used for storing content such as images.
 #[derive(Debug)]
 pub struct CommonMarkCache {
@@ -416,6 +485,7 @@ pub struct CommonMarkCache {
     link_hooks: HashMap<String, bool>,
 
     scroll: HashMap<egui::Id, ScrollableCache>,
+    tables: HashMap<egui::Id, TableLayoutCache>,
     pub(self) has_installed_loaders: bool,
 }
 
@@ -429,6 +499,7 @@ impl Default for CommonMarkCache {
             ts: ThemeSet::load_defaults(),
             link_hooks: HashMap::new(),
             scroll: Default::default(),
+            tables: Default::default(),
             has_installed_loaders: false,
         }
     }
@@ -485,6 +556,17 @@ impl CommonMarkCache {
     /// id was not in the cache.
     pub fn clear_scrollable_with_id(&mut self, source_id: impl std::hash::Hash) -> bool {
         self.scroll.remove(&egui::Id::new(source_id)).is_some()
+    }
+
+    /// Clear cached column metrics for all tables.
+    pub fn clear_tables(&mut self) {
+        self.tables.clear();
+    }
+
+    /// Clear cached column metrics for a specific table. Returns false if
+    /// the id was not in the cache.
+    pub fn clear_table_with_id(&mut self, source_id: impl std::hash::Hash) -> bool {
+        self.tables.remove(&egui::Id::new(source_id)).is_some()
     }
 
     /// If the user clicks on a link in the markdown render that has `name` as a link. The hook
@@ -562,6 +644,13 @@ pub fn scroll_cache<'a>(cache: &'a mut CommonMarkCache, id: &egui::Id) -> &'a mu
         cache.scroll.insert(*id, Default::default());
     }
     cache.scroll.get_mut(id).unwrap()
+}
+
+pub fn table_cache<'a>(
+    cache: &'a mut CommonMarkCache,
+    id: &egui::Id,
+) -> &'a mut TableLayoutCache {
+    cache.tables.entry(*id).or_default()
 }
 
 /// Should be called before any rendering

@@ -1,3 +1,5 @@
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::iter::Peekable;
 use std::ops::Range;
 
@@ -453,44 +455,615 @@ impl CommonMarkViewerInternal {
             let id = ui.id().with("_table").with(self.curr_table);
             self.curr_table += 1;
 
+            // We avoid `egui::Grid` here: it auto-sizes columns to widest
+            // content (no per-column width control) and its row-height
+            // plumbing did not propagate wrapped-cell heights reliably,
+            // causing 3+ line cells to overlap the next row. Instead we
+            // measure per-column content width, distribute the available
+            // width proportionally, and lay out manually with
+            // vertical → horizontal → wrapping per cell. `horizontal_wrapped`
+            // inside a fixed-width child ui wraps text and reports the true
+            // multi-line height up to the parent vertical layout.
+            let _ = (id, max_width);
             egui::Frame::group(ui.style()).show(ui, |ui| {
-                let Table { header, rows } = parse_table(events);
+                let Table { mut header, mut rows } = parse_table(events);
+                let num_cols = header.len().max(1);
 
-                egui::Grid::new(id).striped(true).show(ui, |ui| {
-                    for col in header {
-                        ui.horizontal(|ui| {
-                            for (e, src_span) in col {
-                                let tmp_start =
-                                    std::mem::replace(&mut self.line.should_start_newline, false);
-                                let tmp_end =
-                                    std::mem::replace(&mut self.line.should_end_newline, false);
-                                self.event(ui, e, src_span, cache, options, max_width);
-                                self.line.should_start_newline = tmp_start;
-                                self.line.should_end_newline = tmp_end;
-                            }
-                        });
+                // Per GFM ("Spaces around cell content are ignored") strip
+                // leading whitespace from the first text-bearing event and
+                // trailing whitespace from the last. pulldown-cmark already
+                // skips leading whitespace before parsing, but trailing
+                // whitespace before the `|` delimiter survives into Text
+                // events and would otherwise render as visible spaces.
+                fn trim_text_event(e: &mut pulldown_cmark::Event<'_>, end: bool) -> bool {
+                    let s = match e {
+                        pulldown_cmark::Event::Text(s)
+                        | pulldown_cmark::Event::Code(s)
+                        | pulldown_cmark::Event::InlineHtml(s)
+                        | pulldown_cmark::Event::Html(s) => s,
+                        _ => return false,
+                    };
+                    let trimmed: String = if end {
+                        s.trim_end().to_owned()
+                    } else {
+                        s.trim_start().to_owned()
+                    };
+                    if trimmed.len() != s.len() {
+                        *s = pulldown_cmark::CowStr::Boxed(trimmed.into_boxed_str());
                     }
+                    !s.as_ref().is_empty()
+                }
+                fn trim_cell(col: &mut [(pulldown_cmark::Event<'_>, Range<usize>)]) {
+                    for (e, _) in col.iter_mut() {
+                        if trim_text_event(e, false) {
+                            break;
+                        }
+                    }
+                    for (e, _) in col.iter_mut().rev() {
+                        if trim_text_event(e, true) {
+                            break;
+                        }
+                    }
+                }
+                for col in header.iter_mut() {
+                    trim_cell(col);
+                }
+                for row in rows.iter_mut() {
+                    for col in row.iter_mut() {
+                        trim_cell(col);
+                    }
+                }
 
-                    ui.end_row();
+                // `Style::resolve_font_id` is the single source of truth for
+                // mapping a Style snapshot → FontId, shared with the renderer
+                // (`to_richtext_with`). The walker below tracks Style
+                // transitions exactly the way `start_tag`/`end_tag` mutate
+                // `self.text_style`, so each measured run picks the same
+                // FontId the renderer will apply (honoring override_font_id,
+                // monospace for code, and strong_font_family for **strong**).
+                let ui_style = ui.style().clone();
+                let strong_family = options.strong_font_family.as_ref();
+                // Visible gap between adjacent cell contents. Applied on the
+                // row layout's item_spacing.x so it's also accounted for in
+                // the per-column width budget below.
+                let spacing_x = ui.spacing().item_spacing.x.max(8.0);
+                let avail = ui.available_width();
+                let total_spacing = spacing_x * (num_cols.saturating_sub(1)) as f32;
+                let min_col_floor = 24.0_f32;
+                let usable = (avail - total_spacing).max(num_cols as f32 * min_col_floor);
 
-                    for row in rows {
-                        for col in row {
-                            ui.horizontal(|ui| {
-                                for (e, src_span) in col {
-                                    let tmp_start = std::mem::replace(
-                                        &mut self.line.should_start_newline,
-                                        false,
-                                    );
-                                    let tmp_end =
-                                        std::mem::replace(&mut self.line.should_end_newline, false);
-                                    self.event(ui, e, src_span, cache, options, max_width);
-                                    self.line.should_start_newline = tmp_start;
-                                    self.line.should_end_newline = tmp_end;
+                // Hash the table content to key the per-table measurement
+                // cache. Recomputing layout-job widths for every cell every
+                // frame would be wasteful — measurements only change when
+                // the markdown source changes (typical case: streamed LLM
+                // output), so we memoize on `CommonMarkCache`.
+                let content_hash: u64 = {
+                    let mut h = DefaultHasher::new();
+                    num_cols.hash(&mut h);
+                    // Hash both text content and style-tag transitions: the
+                    // measurement cost (number of render-time labels and the
+                    // spacing_x gaps between them) depends on Strong/Emphasis/
+                    // Link boundaries and on Soft/Hard breaks, so cache
+                    // invalidation must follow the same shape.
+                    let hash_col =
+                        |col: &[(pulldown_cmark::Event<'_>, Range<usize>)],
+                         h: &mut DefaultHasher| {
+                            for (e, _) in col {
+                                match e {
+                                    pulldown_cmark::Event::Code(s) => {
+                                        1u8.hash(h);
+                                        s.as_ref().hash(h);
+                                    }
+                                    pulldown_cmark::Event::Text(s)
+                                    | pulldown_cmark::Event::InlineHtml(s)
+                                    | pulldown_cmark::Event::Html(s) => {
+                                        0u8.hash(h);
+                                        s.as_ref().hash(h);
+                                    }
+                                    pulldown_cmark::Event::SoftBreak => {
+                                        0x40u8.hash(h);
+                                    }
+                                    pulldown_cmark::Event::HardBreak => {
+                                        0x41u8.hash(h);
+                                    }
+                                    pulldown_cmark::Event::Start(t) => match t {
+                                        pulldown_cmark::Tag::Strong => {
+                                            0x10u8.hash(h)
+                                        }
+                                        pulldown_cmark::Tag::Emphasis => {
+                                            0x12u8.hash(h)
+                                        }
+                                        pulldown_cmark::Tag::Strikethrough => {
+                                            0x14u8.hash(h)
+                                        }
+                                        pulldown_cmark::Tag::Link {
+                                            dest_url, ..
+                                        } => {
+                                            0x20u8.hash(h);
+                                            dest_url.as_ref().hash(h);
+                                        }
+                                        pulldown_cmark::Tag::Image {
+                                            dest_url, ..
+                                        } => {
+                                            0x30u8.hash(h);
+                                            dest_url.as_ref().hash(h);
+                                        }
+                                        _ => {}
+                                    },
+                                    pulldown_cmark::Event::End(t) => match t {
+                                        pulldown_cmark::TagEnd::Strong => {
+                                            0x11u8.hash(h)
+                                        }
+                                        pulldown_cmark::TagEnd::Emphasis => {
+                                            0x13u8.hash(h)
+                                        }
+                                        pulldown_cmark::TagEnd::Strikethrough => {
+                                            0x15u8.hash(h)
+                                        }
+                                        pulldown_cmark::TagEnd::Link => {
+                                            0x21u8.hash(h)
+                                        }
+                                        pulldown_cmark::TagEnd::Image => {
+                                            0x31u8.hash(h)
+                                        }
+                                        _ => {}
+                                    },
+                                    _ => {}
                                 }
-                            });
+                            }
+                            0xFFu8.hash(h);
+                        };
+                    for col in header.iter() {
+                        hash_col(col, &mut h);
+                    }
+                    0xEEu8.hash(&mut h);
+                    for row in rows.iter() {
+                        for col in row.iter() {
+                            hash_col(col, &mut h);
+                        }
+                        0xEEu8.hash(&mut h);
+                    }
+                    h.finish()
+                };
+
+                // Build / refresh the cached per-column metrics.
+                {
+                    let cached = table_cache(cache, &id);
+                    if cached.content_hash != content_hash
+                        || cached.col_natural.len() != num_cols
+                    {
+                        // Returns (natural_w, min_w) for one cell.
+                        //
+                        // The cell renderer at the bottom of this function
+                        // dispatches every inline event through `self.event`,
+                        // which emits one `ui.label` per Text/Code/InlineHtml/
+                        // Html/SoftBreak event, one `ui.label("\n")` per
+                        // HardBreak (row terminator), and one `ui.link` /
+                        // `ui.hyperlink_to` per `[text](url)` link (the inner
+                        // text runs are collapsed into a single LayoutJob and
+                        // rendered as a single widget). Strong/Emphasis/
+                        // Strikethrough are pure state mutations — no widget.
+                        //
+                        // The cell ui sets `item_spacing.x = spacing_x` (~8px),
+                        // so adjacent widgets are separated by `spacing_x` at
+                        // render time. Measuring multiple runs as one combined
+                        // LayoutJob therefore under-reports the rendered width
+                        // by `(K-1) * spacing_x` and forces the last run onto a
+                        // new line whenever the column allocator gives a width
+                        // close to the under-measured natural. This walk
+                        // mirrors render exactly: per-widget intrinsic width
+                        // plus inter-widget spacing.
+                        //
+                        // Each Text/Code/InlineHtml/Html/SoftBreak event
+                        // becomes one widget at render time. We mirror the
+                        // walk over events, snapshotting the running `Style`
+                        // for each text run so the FontId we measure with is
+                        // exactly the FontId the renderer resolves via
+                        // `Style::to_richtext_with` → `Style::resolve_font_id`.
+                        fn measure_cell(
+                            f: &mut egui::epaint::text::FontsView<'_>,
+                            col: &[(pulldown_cmark::Event<'_>, Range<usize>)],
+                            ui_style: &egui::Style,
+                            strong_family: Option<&egui::FontFamily>,
+                            spacing_x: f32,
+                        ) -> (f32, f32) {
+                            let color = egui::Color32::WHITE;
+
+                            #[derive(Clone)]
+                            struct Run {
+                                s: String,
+                                style: Style,
+                            }
+                            #[derive(Clone)]
+                            enum Widget {
+                                Text(Run),
+                                SoftBreak,
+                                HardBreak,
+                                Link(Vec<Run>),
+                            }
+
+                            let mut widgets: Vec<Widget> = Vec::new();
+                            // Running Style mirrors `start_tag`/`end_tag`'s
+                            // mutations of `self.text_style`. Strong/Emphasis/
+                            // Strikethrough nest, but pulldown won't emit
+                            // overlapping opens for the same kind, so booleans
+                            // suffice (matching the renderer).
+                            let mut style = Style::default();
+                            let mut in_link = false;
+                            let mut in_image = false;
+                            let mut link_runs: Vec<Run> = Vec::new();
+
+                            for (e, _) in col {
+                                match e {
+                                    pulldown_cmark::Event::Start(tag) => match tag {
+                                        pulldown_cmark::Tag::Link { .. } => {
+                                            in_link = true;
+                                            link_runs.clear();
+                                        }
+                                        pulldown_cmark::Tag::Image { .. } => {
+                                            in_image = true;
+                                        }
+                                        pulldown_cmark::Tag::Strong => {
+                                            style.strong = true;
+                                        }
+                                        pulldown_cmark::Tag::Emphasis => {
+                                            style.emphasis = true;
+                                        }
+                                        pulldown_cmark::Tag::Strikethrough => {
+                                            style.strikethrough = true;
+                                        }
+                                        _ => {}
+                                    },
+                                    pulldown_cmark::Event::End(tag) => match tag {
+                                        pulldown_cmark::TagEnd::Link => {
+                                            widgets.push(Widget::Link(
+                                                std::mem::take(&mut link_runs),
+                                            ));
+                                            in_link = false;
+                                        }
+                                        pulldown_cmark::TagEnd::Image => {
+                                            in_image = false;
+                                        }
+                                        pulldown_cmark::TagEnd::Strong => {
+                                            style.strong = false;
+                                        }
+                                        pulldown_cmark::TagEnd::Emphasis => {
+                                            style.emphasis = false;
+                                        }
+                                        pulldown_cmark::TagEnd::Strikethrough => {
+                                            style.strikethrough = false;
+                                        }
+                                        _ => {}
+                                    },
+                                    pulldown_cmark::Event::Text(s)
+                                    | pulldown_cmark::Event::InlineHtml(s)
+                                    | pulldown_cmark::Event::Html(s) => {
+                                        if in_image {
+                                            // Alt text only shown on hover —
+                                            // not part of the cell's flow.
+                                            continue;
+                                        }
+                                        let run = Run {
+                                            s: s.to_string(),
+                                            style: style.clone(),
+                                        };
+                                        if in_link {
+                                            link_runs.push(run);
+                                        } else {
+                                            widgets.push(Widget::Text(run));
+                                        }
+                                    }
+                                    pulldown_cmark::Event::Code(s) => {
+                                        if in_image {
+                                            continue;
+                                        }
+                                        // Renderer toggles `code` around the
+                                        // single Code event (see `event`
+                                        // dispatch).
+                                        let mut run_style = style.clone();
+                                        run_style.code = true;
+                                        let run = Run {
+                                            s: s.to_string(),
+                                            style: run_style,
+                                        };
+                                        if in_link {
+                                            link_runs.push(run);
+                                        } else {
+                                            widgets.push(Widget::Text(run));
+                                        }
+                                    }
+                                    pulldown_cmark::Event::SoftBreak => {
+                                        if !in_link && !in_image {
+                                            widgets.push(Widget::SoftBreak);
+                                        }
+                                    }
+                                    pulldown_cmark::Event::HardBreak => {
+                                        if !in_link && !in_image {
+                                            widgets.push(Widget::HardBreak);
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                            }
+
+                            if widgets.is_empty() {
+                                return (0.0, 0.0);
+                            }
+
+                            let body_id =
+                                Style::default().resolve_font_id(ui_style, strong_family);
+                            let space_w = f
+                                .layout_no_wrap(" ".to_string(), body_id.clone(), color)
+                                .intrinsic_size()
+                                .x;
+
+                            let measure_run = |f: &mut egui::epaint::text::FontsView<'_>,
+                                                   run: &Run,
+                                                   min_w: &mut f32,
+                                                   job: Option<&mut egui::text::LayoutJob>|
+                             -> f32 {
+                                let font = run.style.resolve_font_id(ui_style, strong_family);
+                                for word in run.s.split_whitespace() {
+                                    if word.is_empty() {
+                                        continue;
+                                    }
+                                    let g = f.layout_no_wrap(
+                                        word.to_string(),
+                                        font.clone(),
+                                        color,
+                                    );
+                                    *min_w = min_w.max(g.intrinsic_size().x);
+                                }
+                                if let Some(job) = job {
+                                    job.append(
+                                        &run.s,
+                                        0.0,
+                                        egui::TextFormat::simple(font, color),
+                                    );
+                                    0.0
+                                } else {
+                                    f.layout_no_wrap(run.s.clone(), font, color)
+                                        .intrinsic_size()
+                                        .x
+                                }
+                            };
+
+                            let mut widths: Vec<f32> = Vec::with_capacity(widgets.len());
+                            let mut min_w = 0.0_f32;
+                            for w in &widgets {
+                                match w {
+                                    Widget::Text(run) => {
+                                        widths.push(measure_run(f, run, &mut min_w, None));
+                                    }
+                                    Widget::SoftBreak => {
+                                        widths.push(space_w);
+                                    }
+                                    Widget::HardBreak => {
+                                        // Row terminator: zero horizontal
+                                        // contribution and excluded from the
+                                        // inter-widget spacing count below.
+                                        widths.push(0.0);
+                                    }
+                                    Widget::Link(runs) => {
+                                        // Render path collapses link runs
+                                        // into one LayoutJob and emits one
+                                        // widget — measure the same way.
+                                        let mut job = egui::text::LayoutJob::default();
+                                        job.wrap.max_width = f32::INFINITY;
+                                        for run in runs {
+                                            measure_run(f, run, &mut min_w, Some(&mut job));
+                                        }
+                                        widths.push(f.layout_job(job).intrinsic_size().x);
+                                    }
+                                }
+                            }
+
+                            // K_effective excludes hard breaks (they terminate
+                            // the row rather than sitting on it).
+                            let k_eff = widgets
+                                .iter()
+                                .filter(|w| !matches!(w, Widget::HardBreak))
+                                .count();
+                            let gap_total =
+                                (k_eff.saturating_sub(1)) as f32 * spacing_x;
+                            let natural: f32 = widths.iter().sum::<f32>() + gap_total;
+                            if min_w == 0.0 {
+                                min_w = natural;
+                            }
+                            (natural, min_w)
                         }
 
-                        ui.end_row();
+                        let (col_natural, col_min) = ui.fonts_mut(|f| {
+                            let mut col_natural = vec![0.0_f32; num_cols];
+                            let mut col_min = vec![0.0_f32; num_cols];
+                            for (c, col) in header.iter().take(num_cols).enumerate() {
+                                let (n, m) = measure_cell(f, col, &ui_style, strong_family, spacing_x);
+                                col_natural[c] = col_natural[c].max(n);
+                                col_min[c] = col_min[c].max(m);
+                            }
+                            for row in &rows {
+                                for (c, col) in row.iter().take(num_cols).enumerate() {
+                                    let (n, m) = measure_cell(f, col, &ui_style, strong_family, spacing_x);
+                                    col_natural[c] = col_natural[c].max(n);
+                                    col_min[c] = col_min[c].max(m);
+                                }
+                            }
+                            (col_natural, col_min)
+                        });
+                        cached.content_hash = content_hash;
+                        cached.col_natural = col_natural;
+                        cached.col_min = col_min;
+                    }
+                }
+
+                // Snapshot cached metrics into local arrays so we can release
+                // the &mut CommonMarkCache borrow before rendering (cells
+                // pass `cache` down to `self.event`).
+                let (col_natural, col_min): (Vec<f32>, Vec<f32>) = {
+                    let cached = table_cache(cache, &id);
+                    let n = cached.col_natural.clone();
+                    let m = cached
+                        .col_min
+                        .iter()
+                        .map(|&w| w.max(min_col_floor))
+                        .collect::<Vec<_>>();
+                    (n, m)
+                };
+
+                // Three-case allocation.
+                let sum_natural: f32 = col_natural.iter().sum();
+                let sum_min: f32 = col_min.iter().sum();
+                let col_w: Vec<f32> = if sum_natural <= usable {
+                    // A: everything fits unwrapped.
+                    col_natural.clone()
+                } else if sum_min >= usable {
+                    // C: even minimums overflow; word-breaking unavoidable.
+                    let scale = usable / sum_min.max(1.0);
+                    col_min.iter().map(|&w| w * scale).collect()
+                } else {
+                    // B: water-fill from min toward natural, weighted by
+                    // each column's remaining growth potential. Iterates
+                    // because columns may cap at `col_natural` and free up
+                    // budget for the rest.
+                    let mut widths = col_min.clone();
+                    let mut remaining = usable - sum_min;
+                    let epsilon = 0.5_f32;
+                    for _ in 0..16 {
+                        if remaining <= epsilon {
+                            break;
+                        }
+                        let mut growth_potential = 0.0_f32;
+                        for c in 0..num_cols {
+                            growth_potential += (col_natural[c] - widths[c]).max(0.0);
+                        }
+                        if growth_potential <= epsilon {
+                            break;
+                        }
+                        let mut grew = 0.0_f32;
+                        for c in 0..num_cols {
+                            let cap = (col_natural[c] - widths[c]).max(0.0);
+                            if cap <= 0.0 {
+                                continue;
+                            }
+                            let share = remaining * (cap / growth_potential);
+                            let grow = share.min(cap);
+                            widths[c] += grow;
+                            grew += grow;
+                        }
+                        remaining -= grew;
+                        if grew <= epsilon {
+                            break;
+                        }
+                    }
+                    widths
+                };
+
+                // Skip Start/End TableCell events: parse_row leaks an
+                // End(TableCell) to the head of every column after the first,
+                // and the upstream end_tag handler emits `ui.label("  ")` for
+                // it as a Grid-cell separator hack — that hack renders two
+                // visible, selectable spaces before the cell content here.
+                fn is_cell_delim(e: &pulldown_cmark::Event<'_>) -> bool {
+                    matches!(
+                        e,
+                        pulldown_cmark::Event::Start(pulldown_cmark::Tag::TableCell)
+                            | pulldown_cmark::Event::End(pulldown_cmark::TagEnd::TableCell)
+                    )
+                }
+
+                // Tight content width: sum of column widths plus the gaps
+                // between cells. Used to bound the table's vertical layout
+                // so the surrounding `Frame::group` and the in-table
+                // `separator` don't stretch to the parent's full width.
+                let content_width: f32 = col_w.iter().sum::<f32>()
+                    + spacing_x * (num_cols.saturating_sub(1)) as f32;
+
+                ui.allocate_ui_with_layout(
+                    egui::vec2(content_width, 0.0),
+                    egui::Layout::top_down(egui::Align::Min),
+                    |v_ui| {
+                    v_ui.set_max_width(content_width);
+                    v_ui.spacing_mut().item_spacing.y = 4.0;
+
+                    v_ui.with_layout(
+                        egui::Layout::left_to_right(egui::Align::Min),
+                        |h_ui| {
+                        h_ui.spacing_mut().item_spacing.x = spacing_x;
+                        for (c, col) in header.into_iter().take(num_cols).enumerate() {
+                            let w = col_w[c];
+                            h_ui.allocate_ui_with_layout(
+                                egui::vec2(w, 0.0),
+                                egui::Layout::left_to_right(egui::Align::Min)
+                                    .with_main_wrap(true),
+                                |cell_ui| {
+                                    cell_ui.set_width(w);
+                                    for (e, src_span) in col {
+                                        if is_cell_delim(&e) {
+                                            continue;
+                                        }
+                                        let tmp_start = std::mem::replace(
+                                            &mut self.line.should_start_newline,
+                                            false,
+                                        );
+                                        let tmp_end = std::mem::replace(
+                                            &mut self.line.should_end_newline,
+                                            false,
+                                        );
+                                        self.event(cell_ui, e, src_span, cache, options, w);
+                                        self.line.should_start_newline = tmp_start;
+                                        self.line.should_end_newline = tmp_end;
+                                    }
+                                },
+                            );
+                        }
+                    });
+                    v_ui.separator();
+
+                    let stripe_color = v_ui.visuals().faint_bg_color;
+                    for (row_idx, row) in rows.into_iter().enumerate() {
+                        let row_start = v_ui.cursor().min;
+                        let row_resp = v_ui.with_layout(
+                            egui::Layout::left_to_right(egui::Align::Min),
+                            |h_ui| {
+                            h_ui.spacing_mut().item_spacing.x = spacing_x;
+                            for (c, col) in row.into_iter().take(num_cols).enumerate() {
+                                let w = col_w[c];
+                                h_ui.allocate_ui_with_layout(
+                                    egui::vec2(w, 0.0),
+                                    egui::Layout::left_to_right(egui::Align::Min)
+                                        .with_main_wrap(true),
+                                    |cell_ui| {
+                                        cell_ui.set_width(w);
+                                        for (e, src_span) in col {
+                                            if is_cell_delim(&e) {
+                                                continue;
+                                            }
+                                            let tmp_start = std::mem::replace(
+                                                &mut self.line.should_start_newline,
+                                                false,
+                                            );
+                                            let tmp_end = std::mem::replace(
+                                                &mut self.line.should_end_newline,
+                                                false,
+                                            );
+                                            self.event(cell_ui, e, src_span, cache, options, w);
+                                            self.line.should_start_newline = tmp_start;
+                                            self.line.should_end_newline = tmp_end;
+                                        }
+                                    },
+                                );
+                            }
+                        });
+                        if row_idx % 2 == 1 {
+                            let row_rect = egui::Rect::from_min_max(
+                                egui::pos2(row_start.x, row_start.y),
+                                egui::pos2(
+                                    row_start.x + row_resp.response.rect.width(),
+                                    row_resp.response.rect.bottom(),
+                                ),
+                            );
+                            v_ui.painter().rect_filled(row_rect, 0.0, stripe_color);
+                        }
                     }
                 });
             });
@@ -517,22 +1090,22 @@ impl CommonMarkViewerInternal {
             pulldown_cmark::Event::Start(tag) => self.start_tag(ui, tag, options),
             pulldown_cmark::Event::End(tag) => self.end_tag(ui, tag, cache, options, max_width),
             pulldown_cmark::Event::Text(text) => {
-                self.event_text(text, ui);
+                self.event_text(text, ui, options);
             }
             pulldown_cmark::Event::Code(text) => {
                 self.text_style.code = true;
-                self.event_text(text, ui);
+                self.event_text(text, ui, options);
                 self.text_style.code = false;
             }
             pulldown_cmark::Event::InlineHtml(text) => {
-                self.event_text(text, ui);
+                self.event_text(text, ui, options);
             }
 
             pulldown_cmark::Event::Html(text) => {
                 if options.html_fn.is_some() {
                     self.html_block.push_str(&text);
                 } else {
-                    self.event_text(text, ui);
+                    self.event_text(text, ui, options);
                 }
             }
             pulldown_cmark::Event::FootnoteReference(footnote) => {
@@ -574,8 +1147,12 @@ impl CommonMarkViewerInternal {
         }
     }
 
-    fn event_text(&mut self, text: CowStr, ui: &mut Ui) {
-        let rich_text = self.text_style.to_richtext(ui, &text);
+    fn event_text(&mut self, text: CowStr, ui: &mut Ui, options: &CommonMarkOptions) {
+        let rich_text = self.text_style.to_richtext_with(
+            ui,
+            &text,
+            options.strong_font_family.as_ref(),
+        );
         if let Some(image) = &mut self.image {
             image.alt_text.push(rich_text);
         } else if let Some(block) = &mut self.code_block {
