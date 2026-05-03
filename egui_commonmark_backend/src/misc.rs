@@ -31,8 +31,8 @@ pub struct CommonMarkOptions<'f> {
     pub alerts: AlertBundle,
     /// Whether to present a mutable ui for things like checkboxes
     pub mutable: bool,
-    pub math_fn: Option<&'f crate::RenderMathFn>,
-    pub html_fn: Option<&'f crate::RenderHtmlFn>,
+    pub math_fn: Option<&'f crate::RenderMathFn<'f>>,
+    pub html_fn: Option<&'f crate::RenderHtmlFn<'f>>,
     /// Font family used for `**strong**` runs. When `None`, `RichText::strong()`
     /// is applied (color change only). When set, the strong run is rendered
     /// with the given family at body size — letting host apps wire in a

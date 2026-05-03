@@ -27,6 +27,6 @@ pub use {
 pub use misc::CommonMarkCache;
 
 /// Takes [`egui::Ui`], the math text to be rendered and whether it is inline
-pub type RenderMathFn = dyn Fn(&mut egui::Ui, &str, bool);
+pub type RenderMathFn<'f> = dyn Fn(&mut egui::Ui, &str, bool) + 'f;
 /// Takes [`egui::Ui`] and the html text to be rendered/used
-pub type RenderHtmlFn = dyn Fn(&mut egui::Ui, &str);
+pub type RenderHtmlFn<'f> = dyn Fn(&mut egui::Ui, &str) + 'f;
