@@ -1022,6 +1022,13 @@ impl CommonMarkViewerInternal {
                     let stripe_color = v_ui.visuals().faint_bg_color;
                     for (row_idx, row) in rows.into_iter().enumerate() {
                         let row_start = v_ui.cursor().min;
+                        // Reserve the stripe's paint slot *before* drawing cell
+                        // content so the fill lands behind it. egui paints
+                        // shapes in submission order; the row geometry is only
+                        // known after layout, so we backfill this Noop via
+                        // `painter().set` once the row height is measured.
+                        let stripe_idx = (row_idx % 2 == 1)
+                            .then(|| v_ui.painter().add(egui::Shape::Noop));
                         let row_resp = v_ui.with_layout(
                             egui::Layout::left_to_right(egui::Align::Min),
                             |h_ui| {
@@ -1054,7 +1061,7 @@ impl CommonMarkViewerInternal {
                                 );
                             }
                         });
-                        if row_idx % 2 == 1 {
+                        if let Some(stripe_idx) = stripe_idx {
                             let row_rect = egui::Rect::from_min_max(
                                 egui::pos2(row_start.x, row_start.y),
                                 egui::pos2(
@@ -1062,7 +1069,10 @@ impl CommonMarkViewerInternal {
                                     row_resp.response.rect.bottom(),
                                 ),
                             );
-                            v_ui.painter().rect_filled(row_rect, 0.0, stripe_color);
+                            v_ui.painter().set(
+                                stripe_idx,
+                                egui::Shape::rect_filled(row_rect, 0.0, stripe_color),
+                            );
                         }
                     }
                 });
